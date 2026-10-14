@@ -1,0 +1,164 @@
+name: Record Twitch Stream (On-Demand)
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Twitch Channel Name'
+        required: true
+        default: 'vishislive'
+        type: string
+      duration_hours:
+        description: 'Max Recording Duration (Hours)'
+        required: true
+        default: '5'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+      quality:
+        description: 'Video Quality'
+        required: true
+        default: 'best'
+        type: choice
+        options:
+          - 'best'
+          - '1080p60'
+          - '720p60'
+          - '720p'
+          - '480p'
+      auto_finish:
+        description: 'Upload immediately after stream ends (3-min crash grace period)'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Free Up Disk Space (~55 GB) and Install Tools
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq curl
+          pip install --upgrade streamlink
+
+      - name: Monitor and Record Stream
+        continue-on-error: true
+        run: |
+          CHANNEL="${{ inputs.channel || 'vishislive' }}"
+          QUALITY="${{ inputs.quality || 'best' }}"
+          HOURS="${{ inputs.duration_hours || '5' }}"
+          AUTO_FINISH="${{ inputs.auto_finish || 'true' }}"
+
+          DURATION_SEC=$((HOURS * 3600))
+          END_TIME=$(($(date +%s) + DURATION_SEC))
+          PART=1
+          HAS_RECORDED=false
+
+          echo "Starting on-demand recorder for twitch.tv/$CHANNEL (Max: ${HOURS}h, Quality: $QUALITY)"
+
+          while [ $(date +%s) -lt $END_TIME ]; do
+            REMAINING=$((END_TIME - $(date +%s)))
+
+            if [ $REMAINING -le 60 ]; then
+              break
+            fi
+
+            TS_FILE="part_${PART}.ts"
+            MP4_FILE="part_${PART}.mp4"
+
+            if [ "$HAS_RECORDED" = "true" ] && [ "$AUTO_FINISH" = "true" ]; then
+              echo "Stream ended or dropped. Waiting up to 3 minutes for reconnect..."
+              timeout ${REMAINING}s streamlink --retry-streams 15 --retry-max 12 --twitch-supported-codecs h264 "https://www.twitch.tv/$CHANNEL" "$QUALITY" -o "$TS_FILE"
+            else
+              echo "Waiting for $CHANNEL to go live (${REMAINING}s remaining in window)..."
+              timeout ${REMAINING}s streamlink --retry-streams 30 --twitch-supported-codecs h264 "https://www.twitch.tv/$CHANNEL" "$QUALITY" -o "$TS_FILE"
+            fi
+
+            if [ -s "$TS_FILE" ]; then
+              HAS_RECORDED=true
+              echo "Normalizing Part $PART for merging..."
+              ffmpeg -y -i "$TS_FILE" -c copy "$MP4_FILE"
+              rm -f "$TS_FILE"
+
+              echo "file '$MP4_FILE'" >> mylist.txt
+              PART=$((PART + 1))
+            else
+              if [ "$HAS_RECORDED" = "true" ] && [ "$AUTO_FINISH" = "true" ]; then
+                echo "Streamer did not reconnect within 3 minutes. Finishing and uploading now!"
+                break
+              fi
+            fi
+
+            sleep 10
+          done
+
+      - name: Merge Parts and Upload to Cloud
+        if: always()
+        run: |
+          CHANNEL="${{ inputs.channel || 'vishislive' }}"
+
+          # Rescue any active .ts segment if you manually cancelled the job early
+          for TS_FILE in part_*.ts; do
+            if [ -s "$TS_FILE" ]; then
+              MP4_FILE="${TS_FILE%.ts}.mp4"
+              echo "Rescuing interrupted segment $TS_FILE..."
+              ffmpeg -y -i "$TS_FILE" -c copy "$MP4_FILE"
+              rm -f "$TS_FILE"
+              echo "file '$MP4_FILE'" >> mylist.txt
+            fi
+          done
+
+          if [ -s "mylist.txt" ]; then
+            PART_COUNT=$(wc -l < mylist.txt)
+            FINAL_FILE="${CHANNEL}_$(TZ='Asia/Kolkata' date +%Y-%m-%d_%H-%M-%S_IST).mp4"
+
+            if [ "$PART_COUNT" -eq 1 ]; then
+              FIRST_PART=$(awk -F"'" '{print $2}' mylist.txt)
+              mv "$FIRST_PART" "$FINAL_FILE"
+            else
+              echo "Merging $PART_COUNT parts into a single continuous MP4..."
+              ffmpeg -y -f concat -safe 0 -i mylist.txt -c copy "$FINAL_FILE"
+              rm -f part_*.mp4
+            fi
+
+            echo "Querying best Gofile server and uploading..."
+            GOFILE_SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name // "store1"')
+            GOFILE_RESPONSE=$(curl -s -X POST "https://${GOFILE_SERVER}.gofile.io/contents/uploadfile" -F "file=@$FINAL_FILE")
+            GOFILE_STATUS=$(echo "$GOFILE_RESPONSE" | jq -r '.status')
+
+            # Fallback to general Gofile endpoint if regional server endpoint changes
+            if [ "$GOFILE_STATUS" != "ok" ]; then
+              GOFILE_RESPONSE=$(curl -s -X POST "https://upload.gofile.io/uploadfile" -F "file=@$FINAL_FILE")
+              GOFILE_STATUS=$(echo "$GOFILE_RESPONSE" | jq -r '.status')
+            fi
+
+            if [ "$GOFILE_STATUS" = "ok" ]; then
+              LINK=$(echo "$GOFILE_RESPONSE" | jq -r '.data.downloadPage')
+              echo "=========================================="
+              echo "UPLOAD SUCCESSFUL (GOFILE): $LINK"
+              echo "=========================================="
+              echo "### 🎬 [Click Here to Download from Gofile ($PART_COUNT Part(s) Combined)]($LINK)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "⚠️ Gofile upload failed. Uploading to Litterbox (72h temporary host) as fallback..."
+              LITTER_LINK=$(curl -s -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@$FINAL_FILE" https://litterbox.catbox.moe/resources/internals/api.php)
+
+              if [[ "$LITTER_LINK" == https* ]]; then
+                echo "=========================================="
+                echo "UPLOAD SUCCESSFUL (LITTERBOX): $LITTER_LINK"
+                echo "=========================================="
+                echo "### 🎬 [Click Here to Download from Fallback Host ($PART_COUNT Part(s) Combined)]($LITTER_LINK)" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "❌ Cloud uploads failed."
+                echo "### ❌ Stream recorded ($FINAL_FILE), but cloud uploads failed." >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          else
+            echo "### ❌ Stream never went live during the monitoring window." >> $GITHUB_STEP_SUMMARY
+          fi
