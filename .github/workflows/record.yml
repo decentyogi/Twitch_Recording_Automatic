@@ -31,7 +31,7 @@ on:
           - '720p'
           - '480p'
       auto_finish:
-        description: 'Upload immediately after stream ends (3-min crash grace period)'
+        description: 'Upload immediately after stream ends (10-min crash grace period)'
         required: true
         default: true
         type: boolean
@@ -41,16 +41,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - name: Free Up Disk Space (~55 GB) and Install Tools
+      - name: Fast Install Streamlink
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg jq curl
-          pip install --upgrade streamlink
+          # Install streamlink immediately so recording starts within seconds
+          pip install -q --upgrade streamlink
 
       - name: Monitor and Record Stream
         continue-on-error: true
         run: |
+          # Background Task ("2nd Terminal"): Clean disk space & ensure tools exist while recording runs
+          (
+            sudo ionice -c 3 rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+            if ! command -v ffmpeg &>/dev/null || ! command -v jq &>/dev/null || ! command -v curl &>/dev/null || ! command -v rclone &>/dev/null; then
+              sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg jq curl rclone
+            fi
+          ) >/dev/null 2>&1 &
+
           CHANNEL="${{ inputs.channel || 'vishislive' }}"
           QUALITY="${{ inputs.quality || 'best' }}"
           HOURS="${{ inputs.duration_hours || '5' }}"
@@ -61,10 +67,10 @@ jobs:
           PART=1
           HAS_RECORDED=false
 
-          echo "Starting on-demand recorder for twitch.tv/$CHANNEL (Max: ${HOURS}h, Quality: $QUALITY)"
+          echo "Starting on-demand recorder for twitch.tv/$CHANNEL (Max: ${HOURS}h, Quality:$QUALITY)"
 
-          while [ $(date +%s) -lt $END_TIME ]; do
-            REMAINING=$((END_TIME - $(date +%s)))
+          while [ $(date +\%s) -lt$END_TIME ]; do
+            REMAINING=$((END_TIME -$(date +%s)))
 
             if [ $REMAINING -le 60 ]; then
               break
@@ -74,8 +80,9 @@ jobs:
             MP4_FILE="part_${PART}.mp4"
 
             if [ "$HAS_RECORDED" = "true" ] && [ "$AUTO_FINISH" = "true" ]; then
-              echo "Stream ended or dropped. Waiting up to 3 minutes for reconnect..."
-              timeout ${REMAINING}s streamlink --retry-streams 15 --retry-max 12 --twitch-supported-codecs h264 "https://www.twitch.tv/$CHANNEL" "$QUALITY" -o "$TS_FILE"
+              echo "Stream ended or dropped. Waiting up to 10 minutes for reconnect..."
+              # 15s * 40 retries = 600s (10 minutes)
+              timeout ${REMAINING}s streamlink --retry-streams 15 --retry-max 40 --twitch-supported-codecs h264 "https://www.twitch.tv/$CHANNEL" "$QUALITY" -o "$TS_FILE"
             else
               echo "Waiting for $CHANNEL to go live (${REMAINING}s remaining in window)..."
               timeout ${REMAINING}s streamlink --retry-streams 30 --twitch-supported-codecs h264 "https://www.twitch.tv/$CHANNEL" "$QUALITY" -o "$TS_FILE"
@@ -91,7 +98,7 @@ jobs:
               PART=$((PART + 1))
             else
               if [ "$HAS_RECORDED" = "true" ] && [ "$AUTO_FINISH" = "true" ]; then
-                echo "Streamer did not reconnect within 3 minutes. Finishing and uploading now!"
+                echo "Streamer did not reconnect within 10 minutes. Finishing and uploading now!"
                 break
               fi
             fi
@@ -101,8 +108,15 @@ jobs:
 
       - name: Merge Parts and Upload to Cloud
         if: always()
+        env:
+          RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG }}
         run: |
           CHANNEL="${{ inputs.channel || 'vishislive' }}"
+
+          # Ensure required post-processing tools are ready if the stream ended very quickly
+          if ! command -v ffmpeg &>/dev/null || ! command -v rclone &>/dev/null || ! command -v jq &>/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg jq curl rclone
+          fi
 
           # Rescue any active .ts segment if you manually cancelled the job early
           for TS_FILE in part_*.ts; do
@@ -128,35 +142,74 @@ jobs:
               rm -f part_*.mp4
             fi
 
-            echo "Querying best Gofile server and uploading..."
-            GOFILE_SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name // "store1"')
-            GOFILE_RESPONSE=$(curl -s -X POST "https://${GOFILE_SERVER}.gofile.io/contents/uploadfile" -F "file=@$FINAL_FILE")
-            GOFILE_STATUS=$(echo "$GOFILE_RESPONSE" | jq -r '.status')
+            GDRIVE_SUCCESS=false
 
-            # Fallback to general Gofile endpoint if regional server endpoint changes
-            if [ "$GOFILE_STATUS" != "ok" ]; then
-              GOFILE_RESPONSE=$(curl -s -X POST "https://upload.gofile.io/uploadfile" -F "file=@$FINAL_FILE")
-              GOFILE_STATUS=$(echo "$GOFILE_RESPONSE" | jq -r '.status')
+            # 1st Priority: Upload to Google Drive via RCLONE_CONFIG secret
+            if [ -n "$RCLONE_CONFIG_DATA" ]; then
+              echo "Configuring Rclone for Google Drive upload..."
+              mkdir -p ~/.config/rclone
+              echo "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
+
+              # Automatically detect the remote name from your RCLONE_CONFIG
+              RCLONE_REMOTE=$(rclone listremotes | head -n 1 | tr -d ':')
+
+              if [ -n "$RCLONE_REMOTE" ]; then
+                GDRIVE_FOLDER="Twitch_Recordings/${CHANNEL}"
+                echo "Uploading $FINAL_FILE to Google Drive (${RCLONE_REMOTE}:${GDRIVE_FOLDER})..."
+                if rclone copy "$FINAL_FILE" "${RCLONE_REMOTE}:${GDRIVE_FOLDER}" --drive-chunk-size 64M --stats=15s -v; then
+                  GDRIVE_SUCCESS=true
+                  GDRIVE_LINK=$(rclone link "${RCLONE_REMOTE}:${GDRIVE_FOLDER}/${FINAL_FILE}" 2>/dev/null || true)
+                  echo "=========================================="
+                  echo "UPLOAD SUCCESSFUL (GOOGLE DRIVE): ${RCLONE_REMOTE}:${GDRIVE_FOLDER}/${FINAL_FILE}"
+                  [ -n "$GDRIVE_LINK" ] && echo "LINK: $GDRIVE_LINK"
+                  echo "=========================================="
+                  if [ -n "$GDRIVE_LINK" ]; then
+                    echo "### ✅ [Uploaded to Google Drive ($PART_COUNT Part(s) Combined)]($GDRIVE_LINK)" >> $GITHUB_STEP_SUMMARY
+                  else
+                    echo "### ✅ Uploaded to Google Drive: \`${GDRIVE_FOLDER}/${FINAL_FILE}\` ($PART_COUNT Part(s) Combined)" >> $GITHUB_STEP_SUMMARY
+                  fi
+                else
+                  echo "⚠️ Google Drive upload failed in the middle. Switching to Gofile failsafe..."
+                fi
+              else
+                echo "⚠️ No valid remote found in RCLONE_CONFIG. Switching to Gofile failsafe..."
+              fi
+            else
+              echo "⚠️ RCLONE_CONFIG secret is empty. Switching to Gofile failsafe..."
             fi
 
-            if [ "$GOFILE_STATUS" = "ok" ]; then
-              LINK=$(echo "$GOFILE_RESPONSE" | jq -r '.data.downloadPage')
-              echo "=========================================="
-              echo "UPLOAD SUCCESSFUL (GOFILE): $LINK"
-              echo "=========================================="
-              echo "### 🎬 [Click Here to Download from Gofile ($PART_COUNT Part(s) Combined)]($LINK)" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "⚠️ Gofile upload failed. Uploading to Litterbox (72h temporary host) as fallback..."
-              LITTER_LINK=$(curl -s -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@$FINAL_FILE" https://litterbox.catbox.moe/resources/internals/api.php)
+            # 2nd Priority (Failsafe): Upload to Gofile if Google Drive failed
+            if [ "$GDRIVE_SUCCESS" = "false" ]; then
+              echo "Querying best Gofile server and uploading..."
+              GOFILE_SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name // "store1"')
+              GOFILE_RESPONSE=$(curl -s -X POST "https://${GOFILE_SERVER}.gofile.io/contents/uploadfile" -F "file=@$FINAL_FILE")
+              GOFILE_STATUS=$(echo "$GOFILE_RESPONSE" | jq -r '.status')
 
-              if [[ "$LITTER_LINK" == https* ]]; then
+              # Fallback to general Gofile endpoint if regional server endpoint changes
+              if [ "$GOFILE_STATUS" != "ok" ]; then
+                GOFILE_RESPONSE=$(curl -s -X POST "https://upload.gofile.io/uploadfile" -F "file=@$FINAL_FILE")
+                GOFILE_STATUS=$(echo "$GOFILE_RESPONSE" | jq -r '.status')
+              fi
+
+              if [ "$GOFILE_STATUS" = "ok" ]; then
+                LINK=$(echo "$GOFILE_RESPONSE" | jq -r '.data.downloadPage')
                 echo "=========================================="
-                echo "UPLOAD SUCCESSFUL (LITTERBOX): $LITTER_LINK"
+                echo "UPLOAD SUCCESSFUL (GOFILE FAILSAFE): $LINK"
                 echo "=========================================="
-                echo "### 🎬 [Click Here to Download from Fallback Host ($PART_COUNT Part(s) Combined)]($LITTER_LINK)" >> $GITHUB_STEP_SUMMARY
+                echo "### 🎬 [Click Here to Download from Gofile ($PART_COUNT Part(s) Combined)]($LINK)" >> $GITHUB_STEP_SUMMARY
               else
-                echo "❌ Cloud uploads failed."
-                echo "### ❌ Stream recorded ($FINAL_FILE), but cloud uploads failed." >> $GITHUB_STEP_SUMMARY
+                echo "⚠️ Gofile upload also failed. Uploading to Litterbox (72h temporary host) as final fallback..."
+                LITTER_LINK=$(curl -s -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@$FINAL_FILE" https://litterbox.catbox.moe/resources/internals/api.php)
+
+                if [[ "$LITTER_LINK" == https* ]]; then
+                  echo "=========================================="
+                  echo "UPLOAD SUCCESSFUL (LITTERBOX): $LITTER_LINK"
+                  echo "=========================================="
+                  echo "### 🎬 [Click Here to Download from Fallback Host ($PART_COUNT Part(s) Combined)]($LITTER_LINK)" >> $GITHUB_STEP_SUMMARY
+                else
+                  echo "❌ All cloud uploads failed."
+                  echo "### ❌ Stream recorded ($FINAL_FILE), but all cloud uploads failed." >> $GITHUB_STEP_SUMMARY
+                fi
               fi
             fi
           else
