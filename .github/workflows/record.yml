@@ -184,5 +184,35 @@ jobs:
             if [ "$GDRIVE_SUCCESS" = "false" ]; then
               echo "Uploading to Gofile..."
               GOFILE_SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name // "store1"')
-              GOFILE_RESPONSE=$(curl -s -X POST 
-              
+              GOFILE_RESPONSE=$(curl -s -X POST "https://${GOFILE_SERVER}.gofile.io/contents/uploadfile" -F "file=@$FINAL_FILE")
+              GOFILE_STATUS=$(echo "$GOFILE_RESPONSE" | jq -r '.status')
+
+              if [ "$GOFILE_STATUS" != "ok" ]; then
+                GOFILE_RESPONSE=$(curl -s -X POST "https://upload.gofile.io/uploadfile" -F "file=@$FINAL_FILE")
+                GOFILE_STATUS=$(echo "$GOFILE_RESPONSE" | jq -r '.status')
+              fi
+
+              if [ "$GOFILE_STATUS" = "ok" ]; then
+                LINK=$(echo "$GOFILE_RESPONSE" | jq -r '.data.downloadPage')
+                echo "=========================================="
+                echo "UPLOAD SUCCESSFUL (GOFILE): $LINK"
+                echo "=========================================="
+                echo "### 🎬 [Click Here to Download from Gofile ($PART_COUNT Part(s) Combined)]($LINK)" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "⚠️ Gofile failed. Uploading to Litterbox (72h temporary host)..."
+                LITTER_LINK=$(curl -s -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@$FINAL_FILE" https://litterbox.catbox.moe/resources/internals/api.php)
+
+                if [[ "$LITTER_LINK" == https* ]]; then
+                  echo "=========================================="
+                  echo "UPLOAD SUCCESSFUL (LITTERBOX): $LITTER_LINK"
+                  echo "=========================================="
+                  echo "### 🎬 [Click Here to Download from Fallback Host ($PART_COUNT Part(s) Combined)]($LITTER_LINK)" >> $GITHUB_STEP_SUMMARY
+                else
+                  echo "❌ All cloud uploads failed."
+                  echo "### ❌ Stream recorded ($FINAL_FILE), but all cloud uploads failed." >> $GITHUB_STEP_SUMMARY
+                fi
+              fi
+            fi
+          else
+            echo "### ❌ Stream never went live during the monitoring window." >> $GITHUB_STEP_SUMMARY
+          fi
